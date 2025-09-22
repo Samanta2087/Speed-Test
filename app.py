@@ -1,9 +1,8 @@
-# app.py
 import os
 import threading
 import requests
 import speedtest
-from flask import Flask, request, jsonify
+from flask import Flask, request
 
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
@@ -17,6 +16,7 @@ app = Flask(__name__)
 BASE_URL = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
 HEADERS = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
 
+# ----------- Senders -----------
 def send_text(to, text):
     payload = {
         "messaging_product": "whatsapp",
@@ -24,11 +24,7 @@ def send_text(to, text):
         "type": "text",
         "text": {"body": text}
     }
-    r = requests.post(BASE_URL, headers=HEADERS, json=payload)
-    try:
-        r.raise_for_status()
-    except Exception:
-        app.logger.warning("Send text failed: %s %s", r.status_code, r.text)
+    requests.post(BASE_URL, headers=HEADERS, json=payload)
 
 def send_menu(to):
     payload = {
@@ -47,36 +43,28 @@ def send_menu(to):
             }
         }
     }
-    r = requests.post(BASE_URL, headers=HEADERS, json=payload)
-    try:
-        r.raise_for_status()
-    except Exception:
-        app.logger.warning("Send menu failed: %s %s", r.status_code, r.text)
+    requests.post(BASE_URL, headers=HEADERS, json=payload)
 
-def speedtest_worker(to, quick=False):
+# ----------- Workers -----------
+def speedtest_worker(to):
     try:
-        send_text(to, "🚀 Running speed test... this may take a while.")
+        send_text(to, "🚀 Running speed test... please wait")
         st = speedtest.Speedtest()
         st.get_best_server()
-        # quick option: fewer threads to be faster (but less accurate)
-        if quick:
-            download = st.download(threads=1) / 1_000_000
-            upload = st.upload(threads=1) / 1_000_000
-        else:
-            download = st.download() / 1_000_000
-            upload = st.upload() / 1_000_000
+        download = st.download() / 1_000_000
+        upload = st.upload() / 1_000_000
         ping = st.results.ping
-        msg = (f"✅ Speedtest Complete!\n\n"
-               f"Ping: {ping:.2f} ms\n"
-               f"Download: {download:.2f} Mbps\n"
-               f"Upload: {upload:.2f} Mbps")
-        send_text(to, msg)
+        send_text(to, f"✅ Speedtest Complete!\nPing: {ping:.2f} ms\nDownload: {download:.2f} Mbps\nUpload: {upload:.2f} Mbps")
     except Exception as e:
         send_text(to, f"⚠️ Speedtest failed: {e}")
 
-def run_speedtest_async(to, quick=False):
-    t = threading.Thread(target=speedtest_worker, args=(to, quick), daemon=True)
-    t.start()
+def run_speedtest_async(to):
+    threading.Thread(target=speedtest_worker, args=(to,), daemon=True).start()
+
+# ----------- Routes -----------
+@app.route("/")
+def home():
+    return "✅ WhatsApp Bot is running. Use /webhook for Meta verification.", 200
 
 @app.route("/webhook", methods=["GET"])
 def verify():
@@ -89,57 +77,40 @@ def verify():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True) or {}
-    # Basic safe traversal of the webhook payload
-    entries = data.get("entry", [])
-    for entry in entries:
+    data = request.get_json()
+    if not data:
+        return "No data", 400
+
+    for entry in data.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
-            messages = value.get("messages") or []
-            for msg in messages:
+            for msg in value.get("messages", []):
                 from_number = msg.get("from")
-                if not from_number:
-                    continue
-                # text message
                 if "text" in msg:
-                    text = msg["text"].get("body", "").strip().lower()
-                    if text == "menu" or text == "/menu":
+                    text = msg["text"]["body"].strip().lower()
+                    if text in ["menu", "/menu"]:
                         send_menu(from_number)
-                    elif text == "speedtest" or text == "/speedtest":
-                        # start speedtest in background
-                        run_speedtest_async(from_number, quick=False)
-                    elif text == "quick" or text == "/quick":
-                        run_speedtest_async(from_number, quick=True)
-                    elif text == "ping" or text == "/ping":
-                        # quick ping obtained from speedtest results
-                        try:
-                            st = speedtest.Speedtest()
-                            st.get_best_server()
-                            send_text(from_number, f"📡 Ping: {st.results.ping:.2f} ms")
-                        except Exception as e:
-                            send_text(from_number, f"⚠️ Ping failed: {e}")
+                    elif text in ["speedtest", "/speedtest"]:
+                        run_speedtest_async(from_number)
+                    elif text in ["ping", "/ping"]:
+                        st = speedtest.Speedtest()
+                        st.get_best_server()
+                        send_text(from_number, f"📡 Ping: {st.results.ping:.2f} ms")
                     else:
                         send_text(from_number, "Send 'menu' to see options.")
-                # interactive button replies
                 elif "interactive" in msg:
-                    interactive = msg["interactive"]
-                    # button reply
-                    if "button_reply" in interactive:
-                        button_id = interactive["button_reply"].get("id")
-                        if button_id == "speedtest":
-                            run_speedtest_async(from_number, quick=False)
-                        elif button_id == "ping":
-                            try:
-                                st = speedtest.Speedtest()
-                                st.get_best_server()
-                                send_text(from_number, f"📡 Ping: {st.results.ping:.2f} ms")
-                            except Exception as e:
-                                send_text(from_number, f"⚠️ Ping failed: {e}")
-                        elif button_id == "menu":
-                            send_menu(from_number)
+                    button_id = msg["interactive"]["button_reply"]["id"]
+                    if button_id == "speedtest":
+                        run_speedtest_async(from_number)
+                    elif button_id == "ping":
+                        st = speedtest.Speedtest()
+                        st.get_best_server()
+                        send_text(from_number, f"📡 Ping: {st.results.ping:.2f} ms")
+                    elif button_id == "menu":
+                        send_menu(from_number)
+
     return "OK", 200
 
 if __name__ == "__main__":
-    # Render sets PORT in env — fallback to 5000 locally
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
